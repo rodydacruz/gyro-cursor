@@ -8,11 +8,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Point;
 import android.hardware.Sensor;
+import android.hardware.display.DisplayManager;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
@@ -48,6 +51,9 @@ public class CursorService extends AccessibilityService
     static final String KEY_INVERT_Y = "invert_y";
     static final int DEFAULT_SENSITIVITY = 50;
 
+    /** True while the service is actually running (the settings screen shows it). */
+    static volatile boolean running;
+
     /** Max time between the two Volume Down presses to count as a double press. */
     private static final long DOUBLE_PRESS_MS = 350;
     /** Length of each piece of the virtual finger's movement. */
@@ -63,6 +69,7 @@ public class CursorService extends AccessibilityService
     private boolean gravityFromAccelerometer;
     private SharedPreferences prefs;
     private CursorView cursorView;
+    private Display display;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private boolean enabled = true;
@@ -102,7 +109,9 @@ public class CursorService extends AccessibilityService
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-        density =getResources().getDisplayMetrics().density;
+        density = getResources().getDisplayMetrics().density;
+        DisplayManager dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        display = dm.getDisplay(Display.DEFAULT_DISPLAY);
 
         gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY);
@@ -128,10 +137,12 @@ public class CursorService extends AccessibilityService
         screenOn = pm == null || pm.isInteractive();
 
         updateState();
+        running = true;
     }
 
     @Override
     public void onDestroy() {
+        running = false;
         handler.removeCallbacksAndMessages(null);
         if (sensorManager != null) sensorManager.unregisterListener(this);
         sensorsRegistered = false;
@@ -185,12 +196,27 @@ public class CursorService extends AccessibilityService
     }
 
     // ---------------------------------------------------------------- overlay
+    //
+    // The overlay window is only as big as the dot and is moved around the screen.
+    // (A full-screen see-through window costs ~50 MB of graphics memory, which made
+    // Xiaomi kill the app first whenever the camera needed memory.)
+
+    private WindowManager.LayoutParams overlayParams;
+    private int windowSize;                       // px, square window
+    private int screenW, screenH;                 // px, in the current rotation
+    private float cursorX = -1f, cursorY = -1f;   // centre of the dot, screen px
 
     private void addOverlay() {
+        windowSize = Math.round(64 * density);
+        updateScreenSize();
+        if (cursorX < 0f) {                       // start in the middle
+            cursorX = screenW / 2f;
+            cursorY = screenH / 2f;
+        }
         cursorView = new CursorView(this);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
+                windowSize,
+                windowSize,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 // Touches go straight through to the app underneath.
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -205,6 +231,8 @@ public class CursorService extends AccessibilityService
         } else if (Build.VERSION.SDK_INT >= 28) {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
+        overlayParams = lp;
+        placeWindow();
         windowManager.addView(cursorView, lp);
     }
 
@@ -212,6 +240,55 @@ public class CursorService extends AccessibilityService
         if (cursorView == null) return;
         try { windowManager.removeView(cursorView); } catch (Exception ignored) { }
         cursorView = null;
+    }
+
+    /** Moves the dot by (dx, dy) pixels. */
+    private void moveCursor(float dx, float dy) {
+        if (dx == 0f && dy == 0f) return;
+        cursorX += dx;
+        cursorY += dy;
+        relayout();
+    }
+
+    /** Keeps the dot on screen and moves the window to it if needed. */
+    private void relayout() {
+        cursorX = Math.max(0f, Math.min(screenW - 1f, cursorX));
+        cursorY = Math.max(0f, Math.min(screenH - 1f, cursorY));
+        if (placeWindow() && cursorView != null) {
+            try { windowManager.updateViewLayout(cursorView, overlayParams); } catch (Exception ignored) { }
+        }
+    }
+
+    /** Centres the window on the dot. Returns true if the window position changed. */
+    private boolean placeWindow() {
+        int x = Math.round(cursorX - windowSize / 2f);
+        int y = Math.round(cursorY - windowSize / 2f);
+        if (x == overlayParams.x && y == overlayParams.y) return false;
+        overlayParams.x = x;
+        overlayParams.y = y;
+        return true;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void updateScreenSize() {
+        Point size = new Point();
+        if (display != null) display.getRealSize(size);
+        screenW = size.x;
+        screenH = size.y;
+    }
+
+    /** Screen rotated: keep the dot at the same relative spot. */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (cursorView == null) return;
+        int oldW = screenW, oldH = screenH;
+        updateScreenSize();
+        if (oldW > 0 && oldH > 0 && (oldW != screenW || oldH != screenH)) {
+            cursorX = cursorX * screenW / oldW;
+            cursorY = cursorY * screenH / oldH;
+        }
+        relayout();
     }
 
     // ---------------------------------------------------------------- sensors
@@ -234,12 +311,11 @@ public class CursorService extends AccessibilityService
         lastGyroTimestamp = e.timestamp;
         if (last == 0) return;
         float dt = (e.timestamp - last) * 1e-9f;
-        CursorView view = cursorView;
-        if (dt <= 0f || dt > 0.1f || view == null || view.getWidth() == 0) return;
+        if (dt <= 0f || dt > 0.1f || cursorView == null || screenW == 0) return;
 
         // Device axes -> current screen axes (x right, y up, z towards you),
         // so it still works in landscape.
-        int rotation = displayRotation(view);
+        int rotation = display == null ? Surface.ROTATION_0 : display.getRotation();
         toScreen(e.values, rotation, w);
         toScreen(gravity, rotation, g);
 
@@ -273,16 +349,10 @@ public class CursorService extends AccessibilityService
         if (invertY) vy = -vy;
 
         float pxPerRadian = sensitivity * 12f * density;
-        view.moveBy(vx * dt * pxPerRadian, vy * dt * pxPerRadian);
+        moveCursor(vx * dt * pxPerRadian, vy * dt * pxPerRadian);
 
         // Finger held down? Drag it along with the dot.
         if (fingerIsDown && !segmentInFlight) sendNextSegment();
-    }
-
-    private int displayRotation(View view) {
-        Display d = view.getDisplay();
-        if (d == null) d = windowManager.getDefaultDisplay();
-        return d == null ? Surface.ROTATION_0 : d.getRotation();
     }
 
     private static void toScreen(float[] v, int rotation, float[] out) {
@@ -364,14 +434,11 @@ public class CursorService extends AccessibilityService
      * unlocks; with a PIN/pattern/fingerprint Android shows its unlock prompt.
      */
     private void swipeUpToUnlock() {
-        CursorView view = cursorView;
-        if (view == null || view.getHeight() == 0) return;
-        int[] origin = new int[2];
-        view.getLocationOnScreen(origin);
-        float x = origin[0] + view.getWidth() / 2f;
+        if (screenW == 0 || screenH == 0) return;
+        float x = screenW / 2f;
         Path path = new Path();
-        path.moveTo(x, origin[1] + view.getHeight() * 0.80f);
-        path.lineTo(x, origin[1] + view.getHeight() * 0.30f);
+        path.moveTo(x, screenH * 0.80f);
+        path.lineTo(x, screenH * 0.30f);
         dispatchGesture(new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0, 250))
                 .build(), null, null);
@@ -481,14 +548,16 @@ public class CursorService extends AccessibilityService
     private static float[] cursorOnScreen(CursorView view) {
         int[] origin = new int[2];
         view.getLocationOnScreen(origin);
-        return new float[]{Math.max(0f, origin[0] + view.cx), Math.max(0f, origin[1] + view.cy)};
+        // The dot is drawn in the middle of its small window.
+        return new float[]{
+                Math.max(0f, origin[0] + view.getWidth() / 2f),
+                Math.max(0f, origin[1] + view.getHeight() / 2f)};
     }
 
     // ---------------------------------------------------------------- the dot
 
-    /** Full-screen, see-through view that only draws the dot. */
+    /** Small see-through view that draws the dot in its centre. */
     static final class CursorView extends View {
-        float cx = -1f, cy = -1f;
         private final float radius;
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -522,31 +591,6 @@ public class CursorService extends AccessibilityService
             invalidate();
         }
 
-        @Override
-        protected void onSizeChanged(int w, int h, int oldW, int oldH) {
-            if (cx < 0f || oldW == 0 || oldH == 0) {   // start in the middle
-                cx = w / 2f;
-                cy = h / 2f;
-            } else {                                   // keep relative spot on rotation
-                cx = cx * w / oldW;
-                cy = cy * h / oldH;
-            }
-            clamp();
-        }
-
-        void moveBy(float dx, float dy) {
-            if (dx == 0f && dy == 0f) return;
-            cx += dx;
-            cy += dy;
-            clamp();
-            invalidate();
-        }
-
-        private void clamp() {
-            cx = Math.max(0f, Math.min(getWidth() - 1f, cx));
-            cy = Math.max(0f, Math.min(getHeight() - 1f, cy));
-        }
-
         /** Little expanding ring so you can see the tap happened. */
         void flash() {
             flashStart = SystemClock.uptimeMillis();
@@ -555,6 +599,7 @@ public class CursorService extends AccessibilityService
 
         @Override
         protected void onDraw(Canvas canvas) {
+            float cx = getWidth() / 2f, cy = getHeight() / 2f;
             if (flashStart != 0) {
                 float t = (SystemClock.uptimeMillis() - flashStart) / 250f;
                 if (t < 1f) {

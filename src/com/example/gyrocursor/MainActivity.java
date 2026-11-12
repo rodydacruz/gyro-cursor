@@ -5,6 +5,7 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
+import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.View;
@@ -53,6 +54,16 @@ public class MainActivity extends Activity {
         });
         root.addView(open);
 
+        Button appSettings = new Button(this);
+        appSettings.setText("App settings (Autostart, battery)");
+        appSettings.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", getPackageName(), null)));
+            }
+        });
+        root.addView(appSettings);
+
         root.addView(checkBox("Show cursor", CursorService.KEY_ENABLED, true));
 
         final TextView sensLabel = new TextView(this);
@@ -95,6 +106,9 @@ public class MainActivity extends Activity {
               + "and your PIN / fingerprint is still asked if you have one.\n\n"
               + "One press of either button still changes the volume; holding works too.\n\n"
               + "It starts by itself when the phone boots.\n\n"
+              + "Xiaomi and some other phones stop background apps (for example when "
+              + "the camera opens). Tap \"App settings\", turn on Autostart and set "
+              + "Battery saver to \"No restrictions\" so it keeps running.\n\n"
               + "If Android says the setting is restricted: open Settings > Apps > Gyro Cursor, "
               + "tap the 3-dot menu > \"Allow restricted settings\", then try again.");
         root.addView(help);
@@ -108,9 +122,22 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (isServiceEnabled()) {
-            status.setText("● Service is ON");
+        refreshStatus();
+        // The service may still be starting; check again shortly.
+        status.postDelayed(new Runnable() {
+            @Override public void run() { refreshStatus(); }
+        }, 1000);
+    }
+
+    private void refreshStatus() {
+        if (isServiceEnabled() && CursorService.running) {
+            status.setText("● Running");
             status.setTextColor(0xFF2E9E4F);
+        } else if (isServiceEnabled()) {
+            status.setText("● Turned on, but not running. The phone stopped it "
+                    + "(e.g. when the camera opened). Turn Gyro Cursor off and on again "
+                    + "below, and allow Autostart in App settings.");
+            status.setTextColor(0xFFE37400);
         } else {
             status.setText("● Service is OFF - turn it on below");
             status.setTextColor(0xFFD93025);
