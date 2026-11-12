@@ -2,6 +2,7 @@ package com.example.gyrocursor;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.app.KeyguardManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -57,6 +58,7 @@ public class CursorService extends AccessibilityService
     private WindowManager windowManager;
     private SensorManager sensorManager;
     private AudioManager audioManager;
+    private KeyguardManager keyguardManager;
     private Sensor gyroSensor, gravitySensor;
     private boolean gravityFromAccelerometer;
     private SharedPreferences prefs;
@@ -99,7 +101,8 @@ public class CursorService extends AccessibilityService
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
-        density = getResources().getDisplayMetrics().density;
+        keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        density =getResources().getDisplayMetrics().density;
 
         gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY);
@@ -335,10 +338,14 @@ public class CursorService extends AccessibilityService
     private boolean onVolumeUp(KeyEvent event) {
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             if (event.getRepeatCount() == 0) {
-                if (singleUpPending) {             // second press in time -> BACK
+                if (singleUpPending) {             // second press in time -> UNLOCK or BACK
                     handler.removeCallbacks(singleUpPress);
                     singleUpPending = false;
-                    performGlobalAction(GLOBAL_ACTION_BACK);
+                    if (keyguardManager != null && keyguardManager.isKeyguardLocked()) {
+                        swipeUpToUnlock();
+                    } else {
+                        performGlobalAction(GLOBAL_ACTION_BACK);
+                    }
                 } else {                           // first press -> wait for a second one
                     singleUpPending = true;
                     handler.postDelayed(singleUpPress, DOUBLE_PRESS_MS);
@@ -350,6 +357,24 @@ public class CursorService extends AccessibilityService
             }
         }
         return true;
+    }
+
+    /**
+     * Lock screen showing: swipe up like a finger would. With no screen lock this
+     * unlocks; with a PIN/pattern/fingerprint Android shows its unlock prompt.
+     */
+    private void swipeUpToUnlock() {
+        CursorView view = cursorView;
+        if (view == null || view.getHeight() == 0) return;
+        int[] origin = new int[2];
+        view.getLocationOnScreen(origin);
+        float x = origin[0] + view.getWidth() / 2f;
+        Path path = new Path();
+        path.moveTo(x, origin[1] + view.getHeight() * 0.80f);
+        path.lineTo(x, origin[1] + view.getHeight() * 0.30f);
+        dispatchGesture(new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(path, 0, 250))
+                .build(), null, null);
     }
 
     private boolean singleUpPending;

@@ -14,9 +14,13 @@ Plain Java + Android SDK only: no Gradle, no AndroidX, no frameworks. Android 8.
 | Volume Down twice, keep holding | Touch and hold |
 | Volume Down twice, hold + move the phone | Drag / scroll |
 | Volume Up twice, quickly | Back |
+| Volume Up twice, on the lock screen | Unlock (swipe up) |
 | One press of a volume button | Volume (works as normal) |
 
 Speed and direction can be changed in the app.
+
+Unlock needs the screen to be on (phones don't send the volume buttons to apps while the
+screen is off). If you have a PIN, pattern or fingerprint, Android still asks for it.
 
 ## Build (Windows)
 
