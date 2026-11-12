@@ -14,8 +14,18 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
+import android.graphics.Rect;
+import android.graphics.RectF;
 import android.hardware.Sensor;
 import android.hardware.display.DisplayManager;
+import android.os.HandlerThread;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
@@ -49,6 +59,7 @@ public class CursorService extends AccessibilityService
     static final String KEY_SENSITIVITY = "sensitivity";
     static final String KEY_INVERT_X = "invert_x";
     static final String KEY_INVERT_Y = "invert_y";
+    static final String KEY_AIM_ASSIST = "aim_assist";
     static final int DEFAULT_SENSITIVITY = 50;
 
     /** True while the service is actually running (the settings screen shows it). */
@@ -75,6 +86,7 @@ public class CursorService extends AccessibilityService
     private boolean enabled = true;
     private float sensitivity = DEFAULT_SENSITIVITY;
     private boolean invertX, invertY;
+    private boolean aimAssist = true;
     private float density = 1f;
 
     private boolean screenOn = true;
@@ -136,6 +148,7 @@ public class CursorService extends AccessibilityService
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         screenOn = pm == null || pm.isInteractive();
 
+        startScanner();
         updateState();
         running = true;
     }
@@ -143,6 +156,7 @@ public class CursorService extends AccessibilityService
     @Override
     public void onDestroy() {
         running = false;
+        if (scanThread != null) scanThread.quitSafely();
         handler.removeCallbacksAndMessages(null);
         if (sensorManager != null) sensorManager.unregisterListener(this);
         sensorsRegistered = false;
@@ -152,7 +166,11 @@ public class CursorService extends AccessibilityService
         super.onDestroy();
     }
 
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
+    /** Something on screen changed (new screen, scrolled, updated): rescan the buttons. */
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (aimAssist && enabled && screenOn) requestScan();
+    }
     @Override public void onInterrupt() { }
 
     // ---------------------------------------------------------------- settings
@@ -162,6 +180,7 @@ public class CursorService extends AccessibilityService
         sensitivity = Math.max(1, prefs.getInt(KEY_SENSITIVITY, DEFAULT_SENSITIVITY));
         invertX = prefs.getBoolean(KEY_INVERT_X, false);
         invertY = prefs.getBoolean(KEY_INVERT_Y, false);
+        aimAssist = prefs.getBoolean(KEY_AIM_ASSIST, true);
     }
 
     @Override
@@ -178,6 +197,9 @@ public class CursorService extends AccessibilityService
         }
         if (enabled && cursorView == null) addOverlay();
         if (!enabled && cursorView != null) removeOverlay();
+
+        if (aimAssist && enabled && screenOn) requestScan();
+        if (!aimAssist) setHighlight(null);
 
         boolean wantSensors = enabled && screenOn && cursorView != null;
         if (wantSensors && !sensorsRegistered) {
@@ -213,6 +235,7 @@ public class CursorService extends AccessibilityService
             cursorX = screenW / 2f;
             cursorY = screenH / 2f;
         }
+        addOutline();                             // added first so the dot stays on top
         cursorView = new CursorView(this);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 windowSize,
@@ -237,6 +260,7 @@ public class CursorService extends AccessibilityService
     }
 
     private void removeOverlay() {
+        removeOutline();
         if (cursorView == null) return;
         try { windowManager.removeView(cursorView); } catch (Exception ignored) { }
         cursorView = null;
@@ -349,7 +373,15 @@ public class CursorService extends AccessibilityService
         if (invertY) vy = -vy;
 
         float pxPerRadian = sensitivity * 12f * density;
-        moveCursor(vx * dt * pxPerRadian, vy * dt * pxPerRadian);
+        float dx = vx * dt * pxPerRadian;
+        float dy = vy * dt * pxPerRadian;
+        if (aimAssist && !fingerIsDown) {           // no snapping while dragging/scrolling
+            float[] m = aimAssist(dx, dy, (float) Math.sqrt(vx * vx + vy * vy), dt);
+            dx = m[0];
+            dy = m[1];
+        }
+        moveCursor(dx, dy);
+        if (aimAssist) setHighlight(fingerIsDown ? null : targetUnderDot());
 
         // Finger held down? Drag it along with the dot.
         if (fingerIsDown && !segmentInFlight) sendNextSegment();
@@ -552,6 +584,243 @@ public class CursorService extends AccessibilityService
         return new float[]{
                 Math.max(0f, origin[0] + view.getWidth() / 2f),
                 Math.max(0f, origin[1] + view.getHeight() / 2f)};
+    }
+
+    // ---------------------------------------------------------------- aim assist
+    //
+    // Like aim assist in shooters. A background thread asks Android where the
+    // clickable things are (buttons, links, toggles, text fields - positions only).
+    // Then, every gyro update:
+    //   - over a button the dot moves slower (easy to stay on it),
+    //   - near a button and moving slowly, the dot is pulled onto it,
+    //   - the button under the dot gets an outline.
+    // Moving the phone faster breaks free.
+
+    /** Speed multiplier while the dot is over a button. */
+    private static final float FRICTION = 0.45f;
+    /** How fast the pull works (1/s). */
+    private static final float PULL_RATE = 10f;
+    /** Turning faster than this (rad/s) switches the pull off. */
+    private static final float PULL_FADE_SPEED = 0.35f;
+    /** Don't rescan more often than this. */
+    private static final long SCAN_INTERVAL_MS = 250;
+
+    /** Clickable rectangles of one window, in screen pixels. */
+    private static final class WindowTargets {
+        final Rect bounds = new Rect();
+        final ArrayList<Rect> rects = new ArrayList<>();
+        int layer;
+    }
+
+    private HandlerThread scanThread;
+    private Handler scanHandler;
+    /** Latest scan, top window first. Replaced as a whole, never modified. */
+    private volatile WindowTargets[] targets = new WindowTargets[0];
+    private final AtomicBoolean scanQueued = new AtomicBoolean();
+    private volatile long lastScanTime;
+
+    private final Runnable scanRunnable = new Runnable() {
+        @Override public void run() {
+            scanQueued.set(false);
+            lastScanTime = SystemClock.uptimeMillis();
+            targets = scanTargets();
+            handler.post(refreshHighlight);
+        }
+    };
+
+    /** Screen changed while the dot stands still: update the outline too. */
+    private final Runnable refreshHighlight = new Runnable() {
+        @Override public void run() {
+            if (aimAssist && cursorView != null) setHighlight(targetUnderDot());
+        }
+    };
+
+    private void startScanner() {
+        scanThread = new HandlerThread("gyro-cursor-scan");
+        scanThread.start();
+        scanHandler = new Handler(scanThread.getLooper());
+    }
+
+    /** Asks for a rescan soon (at most every SCAN_INTERVAL_MS). */
+    private void requestScan() {
+        if (scanHandler == null || !scanQueued.compareAndSet(false, true)) return;
+        long wait = Math.max(0, lastScanTime + SCAN_INTERVAL_MS - SystemClock.uptimeMillis());
+        scanHandler.postDelayed(scanRunnable, wait);
+    }
+
+    /** Runs on the scan thread. */
+    private WindowTargets[] scanTargets() {
+        List<AccessibilityWindowInfo> windows;
+        try {
+            windows = getWindows();
+        } catch (Exception e) {
+            return new WindowTargets[0];
+        }
+        long maxArea = (long) screenW * screenH / 2;    // ignore full-screen "buttons"
+        ArrayList<WindowTargets> out = new ArrayList<>();
+        for (AccessibilityWindowInfo w : windows) {
+            if (w.getType() == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue; // our dot
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root == null) continue;
+            WindowTargets wt = new WindowTargets();
+            w.getBoundsInScreen(wt.bounds);
+            wt.layer = w.getLayer();
+            collectClickables(root, wt.rects, maxArea, 0);
+            out.add(wt);
+        }
+        Collections.sort(out, new Comparator<WindowTargets>() {     // top window first
+            @Override public int compare(WindowTargets a, WindowTargets b) {
+                return Integer.compare(b.layer, a.layer);
+            }
+        });
+        return out.toArray(new WindowTargets[0]);
+    }
+
+    private static void collectClickables(AccessibilityNodeInfo node, ArrayList<Rect> out,
+                                          long maxArea, int depth) {
+        if (node == null || depth > 60 || out.size() > 400) return;
+        if (!node.isVisibleToUser()) return;        // hidden -> its children are hidden too
+        if (node.isClickable() || node.isLongClickable() || node.isCheckable() || node.isEditable()) {
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+            if (!r.isEmpty() && (long) r.width() * r.height() <= maxArea) out.add(r);
+        }
+        int n = node.getChildCount();
+        for (int i = 0; i < n; i++) collectClickables(node.getChild(i), out, maxArea, depth + 1);
+    }
+
+    /**
+     * The button the dot is on or near: only looks at the top window under the dot,
+     * prefers the closest one, and for nested ones (button inside a row) the smallest.
+     */
+    private Rect findTarget(float x, float y, float margin) {
+        for (WindowTargets wt : targets) {
+            if (!wt.bounds.contains((int) x, (int) y)) continue;
+            Rect best = null;
+            float bestDist = Float.MAX_VALUE;
+            long bestArea = Long.MAX_VALUE;
+            for (Rect r : wt.rects) {
+                float dx = Math.max(Math.max(r.left - x, 0f), x - r.right);
+                float dy = Math.max(Math.max(r.top - y, 0f), y - r.bottom);
+                float dist = (float) Math.sqrt(dx * dx + dy * dy);
+                if (dist > margin) continue;
+                long area = (long) r.width() * r.height();
+                if (dist < bestDist - 0.5f || (Math.abs(dist - bestDist) <= 0.5f && area < bestArea)) {
+                    best = r;
+                    bestDist = dist;
+                    bestArea = area;
+                }
+            }
+            return best;    // only the top window under the dot counts
+        }
+        return null;
+    }
+
+    private Rect targetUnderDot() {
+        return findTarget(cursorX, cursorY, 0f);
+    }
+
+    /**
+     * Applies slowdown + pull to a planned move (dx, dy) and returns the new move.
+     * speed = how fast the phone is turning (rad/s).
+     */
+    private float[] aimAssist(float dx, float dy, float speed, float dt) {
+        Rect t = findTarget(cursorX, cursorY, 28f * density);
+        if (t != null) {
+            if (t.contains((int) cursorX, (int) cursorY)) {     // on it: slow down
+                dx *= FRICTION;
+                dy *= FRICTION;
+            }
+            float pull = Math.max(0f, 1f - speed / PULL_FADE_SPEED);
+            if (pull > 0f) {                                     // near it, moving slowly: pull
+                float k = pull * (1f - (float) Math.exp(-PULL_RATE * dt));
+                dx += (aimPoint(t.left, t.right, cursorX) - cursorX) * k;
+                dy += (aimPoint(t.top, t.bottom, cursorY) - cursorY) * k;
+            }
+        }
+        return new float[]{dx, dy};
+    }
+
+    /** Small button: its centre. Big one (like a list row): nearest spot a bit inside. */
+    private float aimPoint(int lo, int hi, float c) {
+        float inset = 24f * density;
+        if (hi - lo <= 120f * density) return (lo + hi) / 2f;
+        return Math.max(lo + inset, Math.min(hi - inset, c));
+    }
+
+    // ---------------------------------------------------------------- outline
+
+    private OutlineView outlineView;
+    private WindowManager.LayoutParams outlineParams;
+    private final Rect outlined = new Rect();
+
+    private void addOutline() {
+        outlineView = new OutlineView(this);
+        outlineView.setVisibility(View.INVISIBLE);
+        outlineParams = new WindowManager.LayoutParams(1, 1,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        outlineParams.gravity = Gravity.TOP | Gravity.START;
+        if (Build.VERSION.SDK_INT >= 30) outlineParams.setFitInsetsTypes(0);
+        windowManager.addView(outlineView, outlineParams);
+    }
+
+    private void removeOutline() {
+        if (outlineView == null) return;
+        try { windowManager.removeView(outlineView); } catch (Exception ignored) { }
+        outlineView = null;
+        outlined.setEmpty();
+    }
+
+    /** Outlines r (or hides the outline when r is null). */
+    private void setHighlight(Rect r) {
+        if (outlineView == null) return;
+        if (r == null) {
+            if (!outlined.isEmpty()) {
+                outlined.setEmpty();
+                outlineView.setVisibility(View.INVISIBLE);
+            }
+            return;
+        }
+        if (r.equals(outlined)) return;
+        outlined.set(r);
+        int pad = Math.round(3 * density);
+        outlineParams.x = r.left - pad;
+        outlineParams.y = r.top - pad;
+        outlineParams.width = r.width() + 2 * pad;
+        outlineParams.height = r.height() + 2 * pad;
+        try { windowManager.updateViewLayout(outlineView, outlineParams); } catch (Exception ignored) { }
+        outlineView.setVisibility(View.VISIBLE);
+    }
+
+    /** Rounded red frame drawn around the button under the dot. */
+    static final class OutlineView extends View {
+        private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF box = new RectF();
+        private final float corner;
+
+        OutlineView(Context context) {
+            super(context);
+            float d = context.getResources().getDisplayMetrics().density;
+            corner = 8f * d;
+            stroke.setStyle(Paint.Style.STROKE);
+            stroke.setStrokeWidth(2.5f * d);
+            stroke.setColor(0xE6FF3B30);
+            fill.setColor(0x1FFF3B30);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float half = stroke.getStrokeWidth() / 2f;
+            box.set(half, half, getWidth() - half, getHeight() - half);
+            canvas.drawRoundRect(box, corner, corner, fill);
+            canvas.drawRoundRect(box, corner, corner, stroke);
+        }
     }
 
     // ---------------------------------------------------------------- the dot

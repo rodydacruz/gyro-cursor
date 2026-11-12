@@ -65,6 +65,7 @@ public class MainActivity extends Activity {
         root.addView(appSettings);
 
         root.addView(checkBox("Show cursor", CursorService.KEY_ENABLED, true));
+        root.addView(checkBox("Aim assist (snap onto buttons)", CursorService.KEY_AIM_ASSIST, true));
 
         final TextView sensLabel = new TextView(this);
         sensLabel.setPadding(0, dp(16), 0, 0);
@@ -95,7 +96,9 @@ public class MainActivity extends Activity {
                 "How to use\n\n"
               + "1. Tap \"Open accessibility settings\", pick Gyro Cursor and turn it on.\n\n"
               + "2. A red dot appears. Turn the phone left/right and tilt it up/down to move it, "
-              + "like pointing a laser out of the back of the phone.\n\n"
+              + "like pointing a laser out of the back of the phone.\n"
+              + "   Aim assist: near a button the dot is pulled onto it and slows down, "
+              + "and the button gets a red outline. Turn faster to break free.\n\n"
               + "3. Volume Down twice = your finger on the dot:\n"
               + "   • Quick double press = tap\n"
               + "   • Double press and keep holding = touch and hold (long press)\n"

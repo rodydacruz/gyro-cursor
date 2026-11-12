@@ -10,6 +10,7 @@ Plain Java + Android SDK only: no Gradle, no AndroidX, no frameworks. Android 8.
 | Do this | Get this |
 |---|---|
 | Turn the phone left / right, tilt it up / down | Move the dot |
+| Move near a button | Aim assist: the dot snaps on, slows down, button gets an outline |
 | Volume Down twice, quickly | Tap |
 | Volume Down twice, keep holding | Touch and hold |
 | Volume Down twice, hold + move the phone | Drag / scroll |
@@ -17,7 +18,8 @@ Plain Java + Android SDK only: no Gradle, no AndroidX, no frameworks. Android 8.
 | Volume Up twice, on the lock screen | Unlock (swipe up) |
 | One press of a volume button | Volume (works as normal) |
 
-Speed and direction can be changed in the app.
+Speed, direction and aim assist can be changed in the app.
+Aim assist only reads where clickable things are on screen (never their text), and nothing leaves the phone.
 
 Unlock needs the screen to be on (phones don't send the volume buttons to apps while the
 screen is off). If you have a PIN, pattern or fingerprint, Android still asks for it.
