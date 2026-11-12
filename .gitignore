@@ -1,0 +1,23 @@
+# Build output (created by build.ps1)
+build/
+*.apk
+*.aab
+*.idsig
+*.dex
+*.class
+
+# Signing keys (build.ps1 makes a new debug.keystore if missing)
+*.keystore
+*.jks
+
+# Local SDK paths / IDE files
+local.properties
+.gradle/
+.idea/
+.vscode/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
