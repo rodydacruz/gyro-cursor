@@ -65,26 +65,11 @@ public class MainActivity extends Activity {
         root.addView(appSettings);
 
         root.addView(checkBox("Show cursor", CursorService.KEY_ENABLED, true));
-        root.addView(checkBox("Aim assist (snap onto buttons)", CursorService.KEY_AIM_ASSIST, true));
 
-        final TextView sensLabel = new TextView(this);
-        sensLabel.setPadding(0, dp(16), 0, 0);
-        root.addView(sensLabel);
-        SeekBar sens = new SeekBar(this);
-        sens.setMax(100);
-        int current = prefs.getInt(CursorService.KEY_SENSITIVITY, CursorService.DEFAULT_SENSITIVITY);
-        sens.setProgress(current);
-        sensLabel.setText("Speed: " + current);
-        sens.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
-                value = Math.max(1, value);
-                sensLabel.setText("Speed: " + value);
-                prefs.edit().putInt(CursorService.KEY_SENSITIVITY, value).apply();
-            }
-            @Override public void onStartTrackingTouch(SeekBar s) { }
-            @Override public void onStopTrackingTouch(SeekBar s) { }
-        });
-        root.addView(sens);
+        // Both sliders take effect immediately, even while you're using the dot.
+        slider(root, "Speed", CursorService.KEY_SENSITIVITY, CursorService.DEFAULT_SENSITIVITY, 1, null);
+        slider(root, "Aim assist (grip on buttons)", CursorService.KEY_AIM_STRENGTH,
+                CursorService.DEFAULT_AIM_STRENGTH, 0, "off");
 
         root.addView(checkBox("Invert left / right", CursorService.KEY_INVERT_X, false));
         root.addView(checkBox("Invert up / down", CursorService.KEY_INVERT_Y, false));
@@ -97,8 +82,9 @@ public class MainActivity extends Activity {
               + "1. Tap \"Open accessibility settings\", pick Gyro Cursor and turn it on.\n\n"
               + "2. A red dot appears. Turn the phone left/right and tilt it up/down to move it, "
               + "like pointing a laser out of the back of the phone.\n"
-              + "   Aim assist: near a button the dot is pulled onto it and slows down, "
-              + "and the button gets a red outline. Turn faster to break free.\n\n"
+              + "   Aim assist: when you move slowly near a button, the dot slips onto its "
+              + "edge and slows down a little; the button gets a red outline. Fast tilts are "
+              + "never slowed. Set the grip with the Aim assist slider (0 = off).\n\n"
               + "3. Volume Down twice = your finger on the dot:\n"
               + "   • Quick double press = tap\n"
               + "   • Double press and keep holding = touch and hold (long press)\n"
@@ -145,6 +131,34 @@ public class MainActivity extends Activity {
             status.setText("● Service is OFF - turn it on below");
             status.setTextColor(0xFFD93025);
         }
+    }
+
+    /** A labelled 0..100 slider saved to prefs[key]. zeroText (if set) is shown at 0. */
+    private void slider(LinearLayout root, final String name, final String key, int def,
+                        final int min, final String zeroText) {
+        final TextView label = new TextView(this);
+        label.setTextSize(16);
+        label.setPadding(0, dp(16), 0, 0);
+        root.addView(label);
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(100);
+        int current = Math.max(min, prefs.getInt(key, def));
+        bar.setProgress(current);
+        label.setText(sliderText(name, current, zeroText));
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
+                value = Math.max(min, value);
+                label.setText(sliderText(name, value, zeroText));
+                prefs.edit().putInt(key, value).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) { }
+            @Override public void onStopTrackingTouch(SeekBar s) { }
+        });
+        root.addView(bar);
+    }
+
+    private static String sliderText(String name, int value, String zeroText) {
+        return name + ": " + (value == 0 && zeroText != null ? zeroText : String.valueOf(value));
     }
 
     private CheckBox checkBox(String label, final String key, boolean def) {

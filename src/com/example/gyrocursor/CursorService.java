@@ -59,7 +59,8 @@ public class CursorService extends AccessibilityService
     static final String KEY_SENSITIVITY = "sensitivity";
     static final String KEY_INVERT_X = "invert_x";
     static final String KEY_INVERT_Y = "invert_y";
-    static final String KEY_AIM_ASSIST = "aim_assist";
+    static final String KEY_AIM_STRENGTH = "aim_strength";
+    static final int DEFAULT_AIM_STRENGTH = 30;
     static final int DEFAULT_SENSITIVITY = 50;
 
     /** True while the service is actually running (the settings screen shows it). */
@@ -87,6 +88,7 @@ public class CursorService extends AccessibilityService
     private float sensitivity = DEFAULT_SENSITIVITY;
     private boolean invertX, invertY;
     private boolean aimAssist = true;
+    private float aimStrength = DEFAULT_AIM_STRENGTH / 100f;
     private float density = 1f;
 
     private boolean screenOn = true;
@@ -180,7 +182,9 @@ public class CursorService extends AccessibilityService
         sensitivity = Math.max(1, prefs.getInt(KEY_SENSITIVITY, DEFAULT_SENSITIVITY));
         invertX = prefs.getBoolean(KEY_INVERT_X, false);
         invertY = prefs.getBoolean(KEY_INVERT_Y, false);
-        aimAssist = prefs.getBoolean(KEY_AIM_ASSIST, true);
+        int strength = prefs.getInt(KEY_AIM_STRENGTH, DEFAULT_AIM_STRENGTH);
+        aimStrength = strength / 100f;
+        aimAssist = strength > 0;                  // 0 on the slider = off
     }
 
     @Override
@@ -590,18 +594,18 @@ public class CursorService extends AccessibilityService
     //
     // Like aim assist in shooters. A background thread asks Android where the
     // clickable things are (buttons, links, toggles, text fields - positions only).
-    // Then, every gyro update:
-    //   - over a button the dot moves slower (easy to stay on it),
-    //   - near a button and moving slowly, the dot is pulled onto it,
+    // Then, every gyro update, but only while you move SLOWLY (fast tilts are untouched):
+    //   - just outside a button, the dot is pulled to just inside its nearest edge
+    //     (never dragged to the centre),
+    //   - over a button the dot moves a bit slower (easy to stay on it),
     //   - the button under the dot gets an outline.
-    // Moving the phone faster breaks free.
 
-    /** Speed multiplier while the dot is over a button. */
-    private static final float FRICTION = 0.45f;
-    /** How fast the pull works (1/s). */
-    private static final float PULL_RATE = 10f;
-    /** Turning faster than this (rad/s) switches the pull off. */
-    private static final float PULL_FADE_SPEED = 0.35f;
+    // How strong the grip is comes from the "Aim assist" slider (aimStrength 0..1):
+    //   "slow" means turning slower than 0.10 .. 0.35 rad/s (fades out above that)
+    //   slowdown over a button : speed x 1.0 (0) .. x 0.45 (1)
+    //   pull speed             : 0 .. 10 per second
+    //   snap distance          : 12 .. 28 dp around a button
+
     /** Don't rescan more often than this. */
     private static final long SCAN_INTERVAL_MS = 250;
 
@@ -725,26 +729,29 @@ public class CursorService extends AccessibilityService
      * speed = how fast the phone is turning (rad/s).
      */
     private float[] aimAssist(float dx, float dy, float speed, float dt) {
-        Rect t = findTarget(cursorX, cursorY, 28f * density);
-        if (t != null) {
-            if (t.contains((int) cursorX, (int) cursorY)) {     // on it: slow down
-                dx *= FRICTION;
-                dy *= FRICTION;
-            }
-            float pull = Math.max(0f, 1f - speed / PULL_FADE_SPEED);
-            if (pull > 0f) {                                     // near it, moving slowly: pull
-                float k = pull * (1f - (float) Math.exp(-PULL_RATE * dt));
-                dx += (aimPoint(t.left, t.right, cursorX) - cursorX) * k;
-                dy += (aimPoint(t.top, t.bottom, cursorY) - cursorY) * k;
-            }
+        float a = aimStrength;
+        Rect t = findTarget(cursorX, cursorY, (12f + 16f * a) * density);
+        if (t == null) return new float[]{dx, dy};
+
+        // 1 when moving slowly, fading to 0 as you tilt faster: fast moves are never slowed.
+        float slow = Math.max(0f, 1f - speed / (0.10f + 0.25f * a));
+        if (slow == 0f) return new float[]{dx, dy};
+
+        if (t.contains((int) cursorX, (int) cursorY)) {         // on it: a bit slower, no pull
+            float friction = 1f - 0.55f * a * slow;
+            dx *= friction;
+            dy *= friction;
+        } else {                                                 // just outside: pull to its edge
+            float k = slow * (1f - (float) Math.exp(-10f * a * dt));
+            dx += (aimPoint(t.left, t.right, cursorX) - cursorX) * k;
+            dy += (aimPoint(t.top, t.bottom, cursorY) - cursorY) * k;
         }
         return new float[]{dx, dy};
     }
 
-    /** Small button: its centre. Big one (like a list row): nearest spot a bit inside. */
+    /** Nearest spot just inside the button (8 dp in), not its centre. */
     private float aimPoint(int lo, int hi, float c) {
-        float inset = 24f * density;
-        if (hi - lo <= 120f * density) return (lo + hi) / 2f;
+        float inset = Math.min((hi - lo) / 2f, 8f * density);
         return Math.max(lo + inset, Math.min(hi - inset, c));
     }
 
